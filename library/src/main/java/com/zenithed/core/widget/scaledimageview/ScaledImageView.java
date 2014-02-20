@@ -391,7 +391,6 @@ public class ScaledImageView extends View {
         }
 
         // Render all loaded tiles. LinkedHashMap used for bottom up rendering - lower res tiles underneath.
-
         for (Map.Entry<Integer, List<Tile>> tileMapEntry : mTileMap.entrySet()) {
             if (tileMapEntry.getKey() == sampleSize || hasMissingTiles) {
                 for (Tile tile : tileMapEntry.getValue()) {
