@@ -30,17 +30,17 @@ import android.support.v4.view.GestureDetectorCompat;
 import android.support.v4.view.ViewCompat;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.SparseArray;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.widget.Scroller;
 
+import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Displays an image subsampled as necessary to avoid loading too much image data into memory. After a pinch to zoom in,
@@ -62,17 +62,18 @@ public class ScaledImageView extends View {
 
 
     protected static final int DEFAULT_SCROLL_DURATION = 250;
-    protected static final float DEFAULT_SCALE = 1f;
 
-    public static final float DEFAULT_SCALE_REAL_SIZE = 1f;
-    public static final float DEFAULT_SCALE_VIEW_SIZE = 0f;
+    public static final float DEFAULT_SCALE_MAXIMUM_SIZE =  2.00f;
+    public static final float DEFAULT_SCALE_REAL_SIZE =     1.00f;
+    public static final float DEFAULT_SCALE_VIEW_SIZE =     0.00f;
 
-    // Max scale allowed (prevent infinite zoom)
-    private float mMaxScale = 2F;
+    private static final int TILE_MAX_SIZE = 2048;
+
 
     private Context mContext;
 
     private Scroller mScroller;
+    private Zoomer mZoomer;
     private GestureDetectorCompat mMovementGestureDetector;
     private ScaleGestureDetector mScaleGestureDetector;
     private final MovementGestureListener mMovementGestureListener =
@@ -86,12 +87,14 @@ public class ScaledImageView extends View {
     // Current scale and scale at start of zoom
     private float mDefaultScale = DEFAULT_SCALE_VIEW_SIZE;
     private float mScale = mDefaultScale;
+    // Max scale allowed (prevent infinite zoom)
+    private float mMaxScale = DEFAULT_SCALE_MAXIMUM_SIZE;
 
     /**
      * Calculated as negative offset of the left and top corners
      * of the content rectangle relative to the viewport.
      */
-    private PointF mTranslate;
+    private final PointF mTranslate = new PointF(0, 0);
 
     // Source image dimensions
     private int mContentWidth;
@@ -103,7 +106,7 @@ public class ScaledImageView extends View {
     // Tile decoder
     private BitmapRegionDecoder mBitmapRegionDecoder;
     // Map of zoom level to tile grid
-    private Map<Integer, List<Tile>> mTileMap;
+    private SparseArray<List<Tile>> mTileMap;
 
     private static Paint sDrawingPaint = new Paint();
     static {
@@ -113,6 +116,12 @@ public class ScaledImageView extends View {
     }
 
     private final Rect mViewPortRect = new Rect();
+
+
+    private float mZoomerInitialScale;
+    private PointF mZoomerInitialDestinationPoint;
+
+    private final List<AsyncTask> mTasks = new ArrayList<AsyncTask>();
 
 
     public ScaledImageView(Context context) {
@@ -143,6 +152,8 @@ public class ScaledImageView extends View {
         mContext = context;
 
         mScroller = new Scroller(mContext);
+        mZoomer = new Zoomer(mContext);
+
         mMovementGestureDetector = new GestureDetectorCompat(mContext, mMovementGestureListener);
         mScaleGestureDetector = new ScaleGestureDetector(mContext, mScaleGestureListener);
         // by default the view must be enabled since it doesn't contain any content.
@@ -160,9 +171,15 @@ public class ScaledImageView extends View {
             }
             mBitmapRegionDecoder = null;
         }
-        if (mTileMap != null) {
-            for (Map.Entry<Integer, List<Tile>> tileMapEntry : mTileMap.entrySet()) {
-                for (Tile tile : tileMapEntry.getValue()) {
+        if (mTileMap != null && mTileMap.size() > 0) {
+            final SparseArray<List<Tile>> tileMap = mTileMap;
+            final int SIZE = mTileMap.size();
+
+            List<Tile> tileList = null;
+
+            for (int i = 0; i < SIZE; i++) {
+                tileList = tileMap.valueAt(i);
+                for (Tile tile : tileList) {
                     if (tile.bitmap != null) {
                         tile.bitmap.recycle();
                         tile.bitmap = null;
@@ -175,7 +192,7 @@ public class ScaledImageView extends View {
         if (resetScale) {
             mScale = mDefaultScale;
         }
-        mTranslate = null;
+        mTranslate.set(0, 0);
         mContentWidth = 0;
         mContentHeight = 0;
         mFullImageSampleSize = 0;
@@ -276,7 +293,6 @@ public class ScaledImageView extends View {
 
         @Override
         public boolean onScaleBegin(ScaleGestureDetector detector) {
-
             initialScale = mScale;
             initialPoint = new PointF(Math.abs(mTranslate.x) + detector.getFocusX(),
                                             Math.abs(mTranslate.y) + detector.getFocusY());
@@ -286,29 +302,9 @@ public class ScaledImageView extends View {
 
         @Override
         public boolean onScale(ScaleGestureDetector detector) {
-
             mScale = Math.min(mMaxScale, detector.getScaleFactor() * mScale);
+            zoomAndFocusOnPoint(initialPoint, new PointF(detector.getFocusX(), detector.getFocusY()), initialScale);
 
-            /**
-             * Every point is related to the original selected on, the only differences
-             * when moving with the scale motions is the tendency of drawing content scale - initialScale (original mScale).
-             */
-            PointF currentPoint = new PointF((initialPoint.x) * (mScale / initialScale),
-                                             (initialPoint.y) * (mScale / initialScale));
-
-            // gets the top and the left points of the viewport.
-            final int pointX = (int) (currentPoint.x - detector.getFocusX());
-            final int pointY = (int) (currentPoint.y - detector.getFocusY());
-
-            mScroller.computeScrollOffset();
-            final int startX = mScroller.getCurrX();
-            final int startY = mScroller.getCurrY();
-
-            mScroller.startScroll(startX, startY, pointX - startX, pointY - startY, 0);
-
-            fitToBounds();
-            refreshRequiredTiles(false);
-            ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
             return true;
         }
     }
@@ -316,28 +312,39 @@ public class ScaledImageView extends View {
     @Override
     public void computeScroll() {
         super.computeScroll();
+        if (isEnabled() && mContentWidth > 0 && mContentHeight > 0) {
 
-        if (isEnabled() && mContentWidth > 0 && mContentHeight > 0 && mScroller.computeScrollOffset()) {
-            final int currX = mScroller.getCurrX();
-            final int currY = mScroller.getCurrY();
+            // handles scroll changes.
+            if (mScroller.computeScrollOffset()) {
+                final int currX = mScroller.getCurrX();
+                final int currY = mScroller.getCurrY();
 
-            final int maxOffsetX = (int) (mContentWidth * mScale) - getWidth();
-            final int maxOffsetY = (int) (mContentHeight * mScale) - getHeight();
+                final int maxOffsetX = (int) (mContentWidth * mScale) - getWidth();
+                final int maxOffsetY = (int) (mContentHeight * mScale) - getHeight();
 
-            if (mScroller.getFinalX() > maxOffsetX) {
-                mScroller.setFinalX(maxOffsetX);
+                if (mScroller.getFinalX() > maxOffsetX) {
+                    mScroller.setFinalX(maxOffsetX);
+                }
+
+                if (mScroller.getFinalY() > maxOffsetY) {
+                    mScroller.setFinalY(maxOffsetY);
+                }
+
+                mTranslate.x = currX * -1;
+                mTranslate.y = currY * -1;
+
+                fitToBounds();
+                refreshRequiredTiles(false);
+                ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
             }
 
-            if (mScroller.getFinalY() > maxOffsetY) {
-                mScroller.setFinalY(maxOffsetY);
+            // handles zoom changes.
+            if (mZoomer.computeZoom()) {
+                mScale = Math.min(mMaxScale, mZoomer.getCurrZoom());
+
+                zoomAndFocusOnPoint(mZoomerInitialDestinationPoint,
+                        new PointF(getWidth() / 2, getHeight() / 2), mZoomerInitialScale);
             }
-
-            mTranslate.x = currX * -1;
-            mTranslate.y = currY * -1;
-
-            fitToBounds();
-            refreshRequiredTiles(false);
-            ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
         }
 
     }
@@ -380,9 +387,14 @@ public class ScaledImageView extends View {
 
         // First check for missing tiles - if there are any we need the base layer underneath to avoid gaps
         boolean hasMissingTiles = false;
-        for (Map.Entry<Integer, List<Tile>> tileMapEntry : mTileMap.entrySet()) {
-            if (tileMapEntry.getKey() == sampleSize) {
-                for (Tile tile : tileMapEntry.getValue()) {
+
+        final SparseArray<List<Tile>> tileMap = mTileMap;
+        final int SIZE = mTileMap.size();
+
+        for (int i = 0; i < SIZE; i++) {
+            if (tileMap.keyAt(i) == sampleSize) {
+                final List<Tile> tileList = tileMap.valueAt(i);
+                for (Tile tile : tileList) {
                     if (tile.visible && (tile.loading || tile.bitmap == null)) {
                         hasMissingTiles = true;
                     }
@@ -391,9 +403,10 @@ public class ScaledImageView extends View {
         }
 
         // Render all loaded tiles. LinkedHashMap used for bottom up rendering - lower res tiles underneath.
-        for (Map.Entry<Integer, List<Tile>> tileMapEntry : mTileMap.entrySet()) {
-            if (tileMapEntry.getKey() == sampleSize || hasMissingTiles) {
-                for (Tile tile : tileMapEntry.getValue()) {
+        for (int i = 0; i < SIZE; i++) {
+            if (tileMap.keyAt(i) == sampleSize || hasMissingTiles) {
+                final List<Tile> tileList = tileMap.valueAt(i);
+                for (Tile tile : tileList) {
                     if (!tile.loading && tile.bitmap != null) {
                         canvas.drawBitmap(tile.bitmap, null, convertRect(sourceToViewRect(tile.sRect)), sDrawingPaint);
                     }
@@ -423,12 +436,14 @@ public class ScaledImageView extends View {
             mFullImageSampleSize /= 2;
         }
 
-        initialiseTileMap();
+        mTileMap = initialiseTileMap(mFullImageSampleSize, mContentWidth, mContentHeight);
 
-        List<Tile> baseGrid = mTileMap.get(mFullImageSampleSize);
+        final List<Tile> baseGrid = mTileMap.get(mFullImageSampleSize);
         for (Tile baseTile : baseGrid) {
             BitmapTileTask task = new BitmapTileTask(this, mBitmapRegionDecoder, baseTile);
             task.execute();
+
+            mTasks.add(task);
         }
 
     }
@@ -446,8 +461,14 @@ public class ScaledImageView extends View {
 
         // Load tiles of the correct sample size that are on screen. Discard tiles off screen, and those that are higher
         // resolution than required, or lower res than required but not the base layer, so the base layer is always present.
-        for (Map.Entry<Integer, List<Tile>> tileMapEntry : mTileMap.entrySet()) {
-            for (Tile tile : tileMapEntry.getValue()) {
+        final SparseArray<List<Tile>> tileMap = mTileMap;
+        final int SIZE = mTileMap.size();
+
+        List<Tile> tileList = null;
+
+        for (int i = 0; i < SIZE; i++) {
+            tileList = tileMap.valueAt(i);
+            for (Tile tile : tileList) {
                 if (tile.sampleSize < sampleSize || (tile.sampleSize > sampleSize && tile.sampleSize != mFullImageSampleSize)) {
                     tile.visible = false;
                     if (tile.bitmap != null) {
@@ -461,6 +482,8 @@ public class ScaledImageView extends View {
                         if (!tile.loading && tile.bitmap == null && load) {
                             BitmapTileTask task = new BitmapTileTask(this, mBitmapRegionDecoder, tile);
                             task.execute();
+
+                            mTasks.add(task);
                         }
                     } else if (tile.sampleSize != mFullImageSampleSize) {
                         tile.visible = false;
@@ -513,9 +536,6 @@ public class ScaledImageView extends View {
      * is set to one dimension fills the view and the image is centered on the other dimension.
      */
     private void fitToBounds() {
-        if (mTranslate == null) {
-            mTranslate = new PointF(0, 0);
-        }
 
         float minScale = Math.min(getWidth() / (float) mContentWidth, getHeight() / (float) mContentHeight);
         mScale = Math.max(minScale, mScale);
@@ -537,26 +557,32 @@ public class ScaledImageView extends View {
     /**
      * Once source image and view dimensions are known, creates a map of sample size to tile grid.
      */
-    private void initialiseTileMap() {
-        this.mTileMap = new LinkedHashMap<Integer, List<Tile>>();
-        int sampleSize = mFullImageSampleSize;
+    private static SparseArray<List<Tile>> initialiseTileMap(int fullImageSampleSize, int contentWidth, int contentHeight) {
+
+        final SparseArray<List<Tile>> tileMap = new SparseArray<List<Tile>>();
+
+        int sampleSize = fullImageSampleSize;
         int tilesPerSide = 1;
+
+        List<Tile> tileGrid = null;
+        Tile tile = null;
+
         while (true) {
-            int sTileWidth = mContentWidth /tilesPerSide;
-            int sTileHeight = mContentHeight /tilesPerSide;
-            int subTileWidth = sTileWidth/sampleSize;
-            int subTileHeight = sTileHeight/sampleSize;
-            while (subTileWidth > 2048 || subTileHeight > 2048) {
+            int sTileWidth = contentWidth / tilesPerSide;
+            int sTileHeight = contentHeight / tilesPerSide;
+            int subTileWidth = sTileWidth / sampleSize;
+            int subTileHeight = sTileHeight / sampleSize;
+            while (subTileWidth > TILE_MAX_SIZE || subTileHeight > TILE_MAX_SIZE) {
                 tilesPerSide *= 2;
-                sTileWidth = mContentWidth /tilesPerSide;
-                sTileHeight = mContentHeight /tilesPerSide;
-                subTileWidth = sTileWidth/sampleSize;
-                subTileHeight = sTileHeight/sampleSize;
+                sTileWidth = contentWidth / tilesPerSide;
+                sTileHeight = contentHeight / tilesPerSide;
+                subTileWidth = sTileWidth / sampleSize;
+                subTileHeight = sTileHeight / sampleSize;
             }
-            List<Tile> tileGrid = new ArrayList<Tile>(tilesPerSide * tilesPerSide);
+            tileGrid = new ArrayList<Tile>(tilesPerSide * tilesPerSide);
             for (int x = 0; x < tilesPerSide; x++) {
                 for (int y = 0; y < tilesPerSide; y++) {
-                    Tile tile = new Tile();
+                    tile = new Tile();
                     tile.sampleSize = sampleSize;
                     tile.sRect = new Rect(
                             x * sTileWidth,
@@ -567,14 +593,17 @@ public class ScaledImageView extends View {
                     tileGrid.add(tile);
                 }
             }
-            mTileMap.put(sampleSize, tileGrid);
+            tileMap.put(sampleSize, tileGrid);
             tilesPerSide = (tilesPerSide == 1) ? 4 : tilesPerSide * 2;
+
             if (sampleSize == 1) {
                 break;
             } else {
                 sampleSize /= 2;
             }
         }
+
+        return tileMap;
     }
 
     /**
@@ -614,7 +643,7 @@ public class ScaledImageView extends View {
         @Override
         protected Point doInBackground(Void... params) {
             try {
-                if (viewRef != null && contextRef != null) {
+                if (viewRef != null && contextRef != null && !isCancelled()) {
                     Context context = contextRef.get();
                     if (context != null) {
                         BitmapRegionDecoder decoder;
@@ -635,12 +664,14 @@ public class ScaledImageView extends View {
 
         @Override
         protected void onPostExecute(Point point) {
-            if (viewRef != null && decoderRef != null) {
+            if (viewRef != null && decoderRef != null && !isCancelled()) {
                 final ScaledImageView scaledImageView = viewRef.get();
                 final BitmapRegionDecoder decoder = decoderRef.get();
                 if (scaledImageView != null && decoder != null && point != null) {
                     scaledImageView.onImageInited(decoder, point.x, point.y);
                 }
+
+                scaledImageView.mTasks.remove(this);
             }
         }
     }
@@ -663,7 +694,7 @@ public class ScaledImageView extends View {
         @Override
         protected Bitmap doInBackground(Void... params) {
             try {
-                if (decoderRef != null && tileRef != null && viewRef != null) {
+                if (decoderRef != null && tileRef != null && viewRef != null && !isCancelled()) {
                     final BitmapRegionDecoder decoder = decoderRef.get();
                     final Tile tile = tileRef.get();
                     if (decoder != null && tile != null && !decoder.isRecycled()) {
@@ -683,7 +714,7 @@ public class ScaledImageView extends View {
 
         @Override
         protected void onPostExecute(Bitmap bitmap) {
-            if (viewRef != null && tileRef != null && bitmap != null) {
+            if (viewRef != null && tileRef != null && bitmap != null && !isCancelled()) {
                 final ScaledImageView scaledImageView = viewRef.get();
                 final Tile tile = tileRef.get();
                 if (scaledImageView != null && tile != null) {
@@ -691,6 +722,8 @@ public class ScaledImageView extends View {
                     tile.loading = false;
                     scaledImageView.onTileLoaded();
                 }
+
+                scaledImageView.mTasks.remove(this);
             }
         }
     }
@@ -756,21 +789,77 @@ public class ScaledImageView extends View {
         final int deltaY = ((startY + portCenterY) - (int) sy) * -1;
 
         mScroller.startScroll(startX, startY, deltaX, deltaY, duration);
-        invalidate();
+        ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
+    }
+
+    private void scaleToHelper(float sx, float sy, float newScale, int duration) {
+        if (newScale > mMaxScale)
+            newScale = mMaxScale;
+
+        if (newScale == mScale)
+            return;
+
+        // if the image is not ready we can't zoom.
+        if (mScale <= 0)
+            return;
+
+        mScroller.forceFinished(true);
+
+        mZoomerInitialScale = mScale;
+        mZoomerInitialDestinationPoint = new PointF(sx, sy);
+
+        mZoomer.startZoom(mScale, newScale, duration);
+        ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
     }
 
     private void setImageFileHelper(String extFile, boolean resetScale) {
         reset(resetScale);
         BitmapInitTask task = new BitmapInitTask(this, getContext(), extFile, false);
         task.execute();
-        invalidate();
+
+        mTasks.add(task);
+
+        ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
     }
 
     private void setImageAssetHelper(String assetName, boolean resetScale) {
         reset(resetScale);
         BitmapInitTask task = new BitmapInitTask(this, getContext(), assetName, true);
         task.execute();
-        invalidate();
+
+        mTasks.add(task);
+
+        ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
+    }
+
+    /**
+     * Manages the scroller to scroll ahead the initial destination point with middling it between the focus point,
+     * while the content's scale is changing..
+     * @param initialDestinationPoint the initial point from the content source to be focused on while zooming (the destination point when zooming ends).
+     * @param focusPoint of the view to middle the destination's source point between it.
+     * @param initialScale the original scale of the content before scaling, not the current mScale value.
+     */
+    private void zoomAndFocusOnPoint(PointF initialDestinationPoint, PointF focusPoint, float initialScale) {
+        /*
+         * Every point is related to the original selected on, the only differences
+         * when moving with the scale motions is the tendency of drawing content scale - initialScale (original mScale).
+         */
+        PointF currentPoint = new PointF((initialDestinationPoint.x) * (mScale / initialScale),
+                                         (initialDestinationPoint.y) * (mScale / initialScale));
+
+        // gets the top and the left points of the viewport.
+        final int pointX = (int) (currentPoint.x - focusPoint.x);
+        final int pointY = (int) (currentPoint.y - focusPoint.y);
+
+        mScroller.computeScrollOffset();
+        final int startX = mScroller.getCurrX();
+        final int startY = mScroller.getCurrY();
+
+        mScroller.startScroll(startX, startY, pointX - startX, pointY - startY, 0);
+
+        fitToBounds();
+        refreshRequiredTiles(false);
+        ViewCompat.postInvalidateOnAnimation(ScaledImageView.this);
     }
 
 
@@ -815,6 +904,7 @@ public class ScaledImageView extends View {
     protected float getContentHeight() {
         return mContentHeight * mScale;
     }
+
 
     /**
      * Retrieves the current view port translation x.
@@ -895,6 +985,20 @@ public class ScaledImageView extends View {
         scrollToHelper(sx, sy, duration);
     }
 
+    /**
+     * Scales the image to the given new scale.
+     */
+    public void scaleTo(float sx, float sy, float newScale) {
+        scaleToHelper(sx, sy, newScale, DEFAULT_SCROLL_DURATION);
+    }
+
+    /**
+     * Scales the image to the given new scale.
+     */
+    public void scaleTo(float sx, float sy, float newScale, int duration) {
+        scaleToHelper(sx, sy, newScale, duration);
+    }
+
 
     /**
      * Call from subclasses to find whether the view is initialised and ready for rendering tiles.
@@ -915,7 +1019,7 @@ public class ScaledImageView extends View {
      * Display an image from a file in internal or external storage
      * @param extFile URI of the file to display.
      * @param resetScale determines if to set the image's initial scale to the default value or not.
-     * @throws java.io.IOException
+     * @throws IOException
      */
     public void setImageFile(String extFile, boolean resetScale) {
         setImageFileHelper(extFile, resetScale);
@@ -933,7 +1037,7 @@ public class ScaledImageView extends View {
      * Display an image from a file in assets.
      * @param assetName asset name.
      * @param resetScale  determines if to set the image's initial scale to the default value or not.
-     * @throws java.io.IOException
+     * @throws IOException
      */
     public void setImageAsset(String assetName, boolean resetScale) {
         setImageAssetHelper(assetName, resetScale);
@@ -955,5 +1059,25 @@ public class ScaledImageView extends View {
         mDefaultScale = defaultScale;
         mScale = mDefaultScale;
     }
+
+    public float getDefaultScale() {
+        return mDefaultScale;
+    }
+
+    /**
+     * Cancels any running tasks related to the view's images.
+     */
+    public void cancelAll() {
+        AsyncTask.Status status;
+
+        for (AsyncTask task : mTasks) {
+            status = task.getStatus();
+            if (status == AsyncTask.Status.PENDING || status == AsyncTask.Status.RUNNING)
+                task.cancel(true);
+        }
+
+        mTasks.clear();
+    }
+
 
 }
