@@ -2,7 +2,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context="com.zenithed.core.widget.scaledimageview.SampleActivity.SampleFragment">
+    tools:context="com.zenithed.sample.scaledimageview.SampleActivity.SampleFragment">
 
     <view
         class="com.zenithed.core.widget.scaledimageview.ScaledImageView"

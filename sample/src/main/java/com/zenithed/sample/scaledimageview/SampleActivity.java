@@ -1,4 +1,4 @@
-package com.zenithed.core.widget.scaledimageview;
+package com.zenithed.sample.scaledimageview;
 
 import android.app.Activity;
 import android.app.Fragment;
@@ -6,6 +6,8 @@ import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+
+import com.zenithed.core.widget.scaledimageview.ScaledImageView;
 
 public class SampleActivity extends Activity {
 
